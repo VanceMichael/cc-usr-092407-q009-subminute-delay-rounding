@@ -39,6 +39,7 @@ CREATE TABLE IF NOT EXISTS impacts (
     flight_number      TEXT NOT NULL,
     affected_endpoint  TEXT NOT NULL,
     impact_status      TEXT NOT NULL,
+    wait_seconds       INTEGER,
     overlap_minutes    INTEGER,
     delay_minutes      INTEGER,
     proposed_departure TEXT,
@@ -53,6 +54,20 @@ CREATE INDEX IF NOT EXISTS idx_impacts_airport ON impacts(airport_code, impact_s
 CREATE INDEX IF NOT EXISTS idx_impacts_flight  ON impacts(flight_id);
 CREATE INDEX IF NOT EXISTS idx_events_airport  ON events(airport_code, event_version);
 """
+
+# Additive migrations for databases created by older builds. The classification
+# (impact_status) and proposed times were stored, so a restart never recomputes
+# them from rounded minutes; wait_seconds is added so the precise wait survives
+# too. Pre-existing rows were written from whole-minute inputs: reconstruct the
+# precise seconds from the adopted minutes. Pending/open-ended rows stay NULL.
+MIGRATIONS = (
+    (
+        "wait_seconds",
+        "ALTER TABLE impacts ADD COLUMN wait_seconds INTEGER",
+        "UPDATE impacts SET wait_seconds = overlap_minutes * 60 "
+        "WHERE overlap_minutes IS NOT NULL",
+    ),
+)
 
 
 def utcnow_iso() -> str:
@@ -74,6 +89,20 @@ class Repository:
             self._conn.execute("PRAGMA foreign_keys=ON")
             self._conn.execute("PRAGMA synchronous=FULL")
             self._conn.executescript(SCHEMA)
+            self._migrate()
+
+    def _migrate(self) -> None:
+        """Apply additive column migrations idempotently."""
+        with self._lock:
+            existing = {
+                r["name"]
+                for r in self._conn.execute("PRAGMA table_info(impacts)")
+            }
+            for column, add_sql, backfill_sql in MIGRATIONS:
+                if column in existing:
+                    continue
+                self._conn.execute(add_sql)
+                self._conn.execute(backfill_sql)
 
     def close(self) -> None:
         with self._lock:
@@ -207,12 +236,14 @@ class Repository:
             """
             INSERT INTO impacts (event_id, root_event_id, airport_code, flight_id,
                                  flight_number, affected_endpoint, impact_status,
-                                 overlap_minutes, delay_minutes, proposed_departure,
-                                 proposed_arrival, passenger_count, crosses_midnight)
+                                 wait_seconds, overlap_minutes, delay_minutes,
+                                 proposed_departure, proposed_arrival,
+                                 passenger_count, crosses_midnight)
             VALUES (:event_id, :root_event_id, :airport_code, :flight_id,
                     :flight_number, :affected_endpoint, :impact_status,
-                    :overlap_minutes, :delay_minutes, :proposed_departure,
-                    :proposed_arrival, :passenger_count, :crosses_midnight)
+                    :wait_seconds, :overlap_minutes, :delay_minutes,
+                    :proposed_departure, :proposed_arrival,
+                    :passenger_count, :crosses_midnight)
             """,
             list(impacts),
         )

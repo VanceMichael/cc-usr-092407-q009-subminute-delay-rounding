@@ -87,6 +87,7 @@ class DisruptionService:
                     "flight_number": flight.flight_number,
                     "affected_endpoint": "none",
                     "impact_status": "resolved",
+                    "wait_seconds": None,
                     "overlap_minutes": 0,
                     "delay_minutes": None,
                     "proposed_departure": None,
@@ -396,6 +397,10 @@ class DisruptionService:
             "flight_number": row["flight_number"],
             "affected_endpoint": row["affected_endpoint"],
             "impact_status": row["impact_status"],
+            # Precise wait in whole seconds is the authoritative business
+            # figure; the minute fields are the adopted operational rounding
+            # (ceil). Clients must not derive classification from the minutes.
+            "wait_seconds": row["wait_seconds"],
             "overlap_minutes": row["overlap_minutes"],
             "delay_minutes": row["delay_minutes"],
             "proposed_departure": row["proposed_departure"],

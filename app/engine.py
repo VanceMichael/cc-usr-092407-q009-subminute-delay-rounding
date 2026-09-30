@@ -10,6 +10,15 @@
 * ``airport.reopened`` 结束事件链，机场在恢复缓冲时间结束后重新运行。
 * 结束时间未知时结果为 ``pending_confirmation``；可在最大延误内改时的结果
   为 ``delayed``；其余受影响航班为 ``cancelled``。
+
+秒级口径：
+
+* 业务判定基于精确的等待*秒数*：先在所有受影响端点间取最大等待秒数，再
+  一次性向上取整到可执行分钟。任何正的等待，哪怕不足一分钟，也要占一个
+  可执行分钟，建议时刻绝不早于机场实际开放时刻。
+* ``wait_seconds`` 保留原始等待秒数，``delay_minutes``/``overlap_minutes``
+  是最终采用的分钟口径，建议运行时刻按采用的分钟生成。展示用分钟数不得
+  反过来决定业务分类。
 """
 
 from __future__ import annotations
@@ -29,7 +38,7 @@ from app.models import (
     IMPACT_DELAYED,
     IMPACT_PENDING,
 )
-from app.timeutil import crosses_local_midnight
+from app.timeutil import ceil_executable_minutes, crosses_local_midnight, wait_seconds
 from app.models import iso_utc
 
 # Severity ordering used when one flight is affected at both endpoints.
@@ -47,15 +56,20 @@ class ClosureWindow:
     terminal: bool  # True for a reopened chain
 
     def contains(self, point: datetime) -> bool:
+        # 左闭右开：point == end 时机场已经开放，不算受影响。
         if point < self.start:
             return False
         return self.end is None or point < self.end
 
-    def minutes_from(self, point: datetime) -> int | None:
-        """计算指定时刻到窗口末端的分钟数；开放窗口返回 None。"""
+    def wait_seconds_from(self, point: datetime) -> int | None:
+        """计算指定时刻到窗口末端的真实等待秒数；开放窗口返回 None。
+
+        调用方只在 ``contains(point)`` 为真时调用，因此闭窗口下结果必为
+        正秒数（端点相接的 0 秒情况已被左闭右开端点排除）。
+        """
         if self.end is None:
             return None
-        return int((self.end - point).total_seconds() // 60)
+        return wait_seconds(point, self.end)
 
 
 def chain_window(
@@ -96,7 +110,7 @@ def chain_window(
 @dataclass(frozen=True)
 class EndpointImpact:
     endpoint: str  # "origin" | "destination"
-    needed_delay: int | None  # None == open-ended closure
+    needed_wait_seconds: int | None  # None == open-ended closure
 
 
 def _endpoint_impact(
@@ -107,7 +121,9 @@ def _endpoint_impact(
     )
     if not window.contains(point):
         return None
-    return EndpointImpact(endpoint=endpoint, needed_delay=window.minutes_from(point))
+    return EndpointImpact(
+        endpoint=endpoint, needed_wait_seconds=window.wait_seconds_from(point)
+    )
 
 
 def classify_flight(
@@ -131,26 +147,31 @@ def classify_flight(
     else:
         affected_endpoint = endpoints[0].endpoint
 
-    # Required delay is driven by the endpoint that can resume latest.
-    finite_needed = [e.needed_delay for e in endpoints if e.needed_delay is not None]
-    if len(finite_needed) < len(endpoints):
+    # 业务判定基于精确秒：受最晚才能恢复的端点驱动。任一端点面对开放窗口
+    # 则整体无法给出确定时刻。先在秒级取最大值，再统一向上取整到可执行
+    # 分钟，保证两端同时受限时结果与端点顺序无关且稳定。
+    finite_waits = [e.needed_wait_seconds for e in endpoints if e.needed_wait_seconds is not None]
+    if len(finite_waits) < len(endpoints):
         status = IMPACT_PENDING
-        needed_delay: int | None = None
+        wait_secs: int | None = None
+        needed_minutes: int | None = None
     else:
-        needed_delay = max(finite_needed)  # type: ignore[arg-type]
-        if flight.can_retime and needed_delay <= flight.max_delay_minutes:
+        wait_secs = max(finite_waits)  # type: ignore[arg-type]
+        needed_minutes = ceil_executable_minutes(wait_secs)
+        if flight.can_retime and needed_minutes <= flight.max_delay_minutes:
             status = IMPACT_DELAYED
         else:
             status = IMPACT_CANCELLED
 
     proposed_departure = proposed_arrival = None
-    overlap = needed_delay
     if status == IMPACT_DELAYED:
+        # 建议时刻按最终采用的可执行分钟平移，必然不早于窗口末端（机场实际
+        # 开放时刻），即使原始等待只有几十秒。
         proposed_departure = iso_utc(
-            flight.scheduled_departure + timedelta(minutes=needed_delay)  # type: ignore[arg-type]
+            flight.scheduled_departure + timedelta(minutes=needed_minutes)  # type: ignore[arg-type]
         )
         proposed_arrival = iso_utc(
-            flight.scheduled_arrival + timedelta(minutes=needed_delay)  # type: ignore[arg-type]
+            flight.scheduled_arrival + timedelta(minutes=needed_minutes)  # type: ignore[arg-type]
         )
 
     return {
@@ -159,8 +180,11 @@ def classify_flight(
         "airport_code": window.airport_code,
         "affected_endpoint": affected_endpoint,
         "impact_status": status,
-        "overlap_minutes": overlap,
-        "delay_minutes": needed_delay if status == IMPACT_DELAYED else None,
+        # 原始等待秒数：业务判定的唯一精确依据；开放窗口为 None。
+        "wait_seconds": wait_secs,
+        # 分钟口径：由精确秒数向上取整得到的最终采用值。
+        "overlap_minutes": needed_minutes,
+        "delay_minutes": needed_minutes if status == IMPACT_DELAYED else None,
         "proposed_departure": proposed_departure,
         "proposed_arrival": proposed_arrival,
         "passenger_count": flight.passenger_count,

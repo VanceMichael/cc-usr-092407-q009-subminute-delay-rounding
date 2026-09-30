@@ -23,6 +23,7 @@ BASE = sys.argv[2] if len(sys.argv) > 2 else "http://127.0.0.1:8080"
 APS_CLOSE = "volc-aps-close001"
 BSR_CLOSE = "volc-bsr-close001"
 KTA_CLOSE = "volc-kta-close001"
+KTA_SECS = "volc-kta-secs001"
 APS_REOPEN = "volc-aps-reopen01"
 APS_CLOSE_2 = "volc-aps-close002"
 
@@ -237,11 +238,45 @@ def seed() -> int:
     check(kx is not None and kx["crosses_midnight"] is True,
           "KX099 closure window crosses Jakarta local midnight")
 
+    print("== seed: sub-minute hold rounds up to an executable minute ==")
+    # KTA reopens at 17:40:30Z; KX099's 17:40:00 departure must hold only 30
+    # real seconds. Floor rounding used to report a 0-minute delay and an
+    # unchanged (non-executable) schedule; the ceiling rule must propose 17:41.
+    # This is a separate later chain at KTA so the BSR pending view is untouched.
+    kta_secs = {
+        "event_id": KTA_SECS,
+        "event_version": 2,
+        "event_type": "airport.closed",
+        "airport_code": "KTA",
+        "effective_from": "2026-09-07T14:00:00Z",
+        "effective_until": "2026-09-07T17:40:30Z",
+        "reported_at": "2026-09-07T13:30:00Z",
+        "reason": "precision reopening time",
+    }
+    status, secs_result = post_event(kta_secs)
+    check(status == 201, f"KTA sub-minute closure accepted (got {status})")
+    secs_impact = impacts_by_flight(secs_result).get("KX-099-20260908")
+    check(secs_impact is not None, "sub-minute closure impacts KX099")
+    if secs_impact:
+        check(secs_impact["impact_status"] == "delayed",
+              f"30s hold is delayed (got {secs_impact['impact_status']})")
+        check(secs_impact["wait_seconds"] == 30,
+              f"raw wait preserved as 30 seconds (got {secs_impact.get('wait_seconds')})")
+        check(secs_impact["overlap_minutes"] == 1,
+              f"any positive wait ceils to 1 minute (got {secs_impact.get('overlap_minutes')})")
+        check(secs_impact["delay_minutes"] == 1,
+              f"adopted delay is 1 minute (got {secs_impact.get('delay_minutes')})")
+        check(secs_impact["proposed_departure"] == "2026-09-07T17:41:00Z",
+              "proposed departure is the executable whole-minute ceiling")
+        check(secs_impact["proposed_departure"] >= "2026-09-07T17:40:30Z",
+              "proposed departure never precedes the actual reopening")
+
     print("== seed: idempotent replay returns the original results ==")
     for label, payload, original in (
         ("APS", aps_close, aps_result),
         ("BSR", bsr_close, bsr_result),
         ("KTA", kta_close, kta_result),
+        ("KTA-secs", kta_secs, secs_result),
     ):
         status, replayed = post_event(dict(payload))
         check(status == 201, f"{label} replay accepted (got {status})")
@@ -421,6 +456,20 @@ def verify() -> int:
     kx = impacts_by_flight(kta).get("KX-099-20260908")
     check(kx is not None and kx["impact_status"] == "delayed" and kx["delay_minutes"] == 20,
           "KTA delayed impact survived")
+
+    # The sub-minute impact must keep its precise wait and executable-minute
+    # adoption after the container restart (no rounding drift on reload).
+    status, kta_secs = request("GET", f"/api/v1/events/{KTA_SECS}")
+    secs_kx = impacts_by_flight(kta_secs).get("KX-099-20260908")
+    check(status == 200 and secs_kx is not None, "sub-minute KTA event survived restart")
+    if secs_kx:
+        check(secs_kx["wait_seconds"] == 30,
+              f"raw 30-second wait survived (got {secs_kx.get('wait_seconds')})")
+        check(secs_kx["delay_minutes"] == 1
+              and secs_kx["overlap_minutes"] == 1,
+              "adopted whole-minute delay survived")
+        check(secs_kx["proposed_departure"] == "2026-09-07T17:41:00Z",
+              "executable proposed departure survived")
 
     _, page = request("GET", "/api/v1/flights/affected?limit=100")
     check(page["pagination"]["total"] == 6,

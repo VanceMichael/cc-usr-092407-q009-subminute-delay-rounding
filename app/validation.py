@@ -25,7 +25,7 @@ from app.models import (
     Airport,
     DisruptionEvent,
 )
-from app.timeutil import parse_event_datetime
+from app.timeutil import ceil_executable_minutes, parse_event_datetime, wait_seconds
 
 EVENT_ID_RE = re.compile(r"^[a-z0-9][a-z0-9-]{7,63}$")
 AIRPORT_RE = re.compile(r"^[A-Z]{3}$")
@@ -43,8 +43,8 @@ ALLOWED_FIELDS = frozenset(
     + ("effective_until", "supersedes_event_id", "reason")
 )
 
-_MIN_WINDOW_MIN = 15
-_MAX_WINDOW_MIN = 7 * 24 * 60  # a closure longer than a week is almost certainly bad input
+_MIN_WINDOW_SEC = 15 * 60
+_MAX_WINDOW_SEC = 7 * 24 * 60 * 60  # a closure longer than a week is almost certainly bad input
 
 
 def validate_event(
@@ -96,7 +96,10 @@ def validate_event(
     assert event_type is not None  # narrowed by the errors check above
 
     if effective_until is not None:
-        window_min = int((effective_until - effective_from).total_seconds() // 60)
+        # Window length is judged on exact elapsed seconds so the boundaries
+        # (15:00 / 7d exactly vs. one second short/long) are stable; the minute
+        # figures in the error detail are the adopted operational rounding.
+        window_sec = wait_seconds(effective_from, effective_until)
         if effective_until <= effective_from:
             semantic.append(
                 {
@@ -104,22 +107,26 @@ def validate_event(
                     "issue": "must_be_after_effective_from",
                 }
             )
-        elif window_min < _MIN_WINDOW_MIN:
+        elif window_sec < _MIN_WINDOW_SEC:
             semantic.append(
                 {
                     "field": "effective_until",
                     "issue": "window_too_short",
-                    "window_minutes": str(window_min),
-                    "minimum_minutes": str(_MIN_WINDOW_MIN),
+                    "window_seconds": str(window_sec),
+                    "minimum_seconds": str(_MIN_WINDOW_SEC),
+                    "window_minutes": str(ceil_executable_minutes(window_sec)),
+                    "minimum_minutes": "15",
                 }
             )
-        elif window_min > _MAX_WINDOW_MIN:
+        elif window_sec > _MAX_WINDOW_SEC:
             semantic.append(
                 {
                     "field": "effective_until",
                     "issue": "window_too_long",
-                    "window_minutes": str(window_min),
-                    "maximum_minutes": str(_MAX_WINDOW_MIN),
+                    "window_seconds": str(window_sec),
+                    "maximum_seconds": str(_MAX_WINDOW_SEC),
+                    "window_minutes": str(ceil_executable_minutes(window_sec)),
+                    "maximum_minutes": str(7 * 24 * 60),
                 }
             )
 
