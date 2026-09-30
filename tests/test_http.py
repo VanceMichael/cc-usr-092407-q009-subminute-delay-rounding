@@ -154,8 +154,26 @@ class HttpTest(ServiceTestCase):
         )
         self.assertEqual(status, 400)
 
-    def test_cross_midnight_event_over_http(self) -> None:
-        # Submitted with a +08:00 offset; equivalent to the 15:00-19:00Z window.
+    def test_subsecond_wait_rounds_up_over_http(self) -> None:
+        # BSR reopens half a second past 16:00. BY205's 15:05 departure needs a
+        # 55 min 30 s hold: the proposal must be 16:01:00, never the original
+        # 16:00:00 (30 seconds before the airport actually reopens).
+        payload = base_event(
+            event_id="evt-subsec-http1",
+            airport_code="BSR",
+            effective_from="2026-09-07T15:00:00Z",
+            effective_until="2026-09-07T16:00:00.5Z",
+        )
+        status, body = _request("POST", f"{self.base}/api/v1/events", payload)
+        self.assertEqual(status, 201)
+        impact = {i["flight_id"]: i for i in body["impacts"]}["BY-205-20260908"]
+        self.assertEqual(impact["impact_status"], "delayed")
+        self.assertEqual(impact["overlap_seconds"], 3300.5)
+        self.assertEqual(impact["overlap_minutes"], 56)
+        self.assertEqual(impact["delay_seconds"], 3360)
+        self.assertEqual(impact["proposed_departure"], "2026-09-07T16:01:00Z")
+
+    def test_cross_midnight_event_over_http(self) -> None:        # Submitted with a +08:00 offset; equivalent to the 15:00-19:00Z window.
         payload = base_event(
             event_id="evt-midnight0001",
             effective_from="2026-09-07T23:00:00+08:00",

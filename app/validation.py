@@ -25,7 +25,7 @@ from app.models import (
     Airport,
     DisruptionEvent,
 )
-from app.timeutil import parse_event_datetime
+from app.timeutil import floor_minutes, parse_event_datetime
 
 EVENT_ID_RE = re.compile(r"^[a-z0-9][a-z0-9-]{7,63}$")
 AIRPORT_RE = re.compile(r"^[A-Z]{3}$")
@@ -96,7 +96,7 @@ def validate_event(
     assert event_type is not None  # narrowed by the errors check above
 
     if effective_until is not None:
-        window_min = int((effective_until - effective_from).total_seconds() // 60)
+        window_min = floor_minutes(effective_until - effective_from)
         if effective_until <= effective_from:
             semantic.append(
                 {

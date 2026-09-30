@@ -3,13 +3,19 @@
 规则：
 
 * 比较前将所有时间统一转换为带时区的 UTC。时间窗口采用左闭右开语义，
-  端点相接不算重叠。
+  端点相接不算重叠；所有秒级差值都在 UTC 上计算，夏令时切换不会扭曲等待量。
 * 航班从受影响机场起飞或抵达受影响机场的计划时刻落入关闭窗口时受影响。
 * ``airport.closed`` 建立事件链，``effective_until = null`` 表示结束时间未知。
 * ``airport.extended`` 延续事件链，并把窗口延长到当前事件的结束时刻。
 * ``airport.reopened`` 结束事件链，机场在恢复缓冲时间结束后重新运行。
 * 结束时间未知时结果为 ``pending_confirmation``；可在最大延误内改时的结果
   为 ``delayed``；其余受影响航班为 ``cancelled``。
+
+秒级口径：计划时刻到窗口末端的真实等待按秒保存（``overlap_seconds``/
+``delay_seconds``），它是唯一的业务判定依据；任何正的等待向上取整到可执行
+分钟（``overlap_minutes``/``delay_minutes``），建议时刻按取整后的分钟平移，
+保证不会早于机场重新开放。分钟字段仅用于展示与分钟级航司限制，不能由它
+反推业务判定。
 """
 
 from __future__ import annotations
@@ -29,7 +35,7 @@ from app.models import (
     IMPACT_DELAYED,
     IMPACT_PENDING,
 )
-from app.timeutil import crosses_local_midnight
+from app.timeutil import ceil_minutes, crosses_local_midnight
 from app.models import iso_utc
 
 # Severity ordering used when one flight is affected at both endpoints.
@@ -51,11 +57,11 @@ class ClosureWindow:
             return False
         return self.end is None or point < self.end
 
-    def minutes_from(self, point: datetime) -> int | None:
-        """计算指定时刻到窗口末端的分钟数；开放窗口返回 None。"""
+    def wait_from(self, point: datetime) -> timedelta | None:
+        """计算指定时刻到窗口末端的精确等待；开放窗口返回 None。"""
         if self.end is None:
             return None
-        return int((self.end - point).total_seconds() // 60)
+        return self.end - point
 
 
 def chain_window(
@@ -96,7 +102,7 @@ def chain_window(
 @dataclass(frozen=True)
 class EndpointImpact:
     endpoint: str  # "origin" | "destination"
-    needed_delay: int | None  # None == open-ended closure
+    needed_wait: timedelta | None  # None == open-ended closure
 
 
 def _endpoint_impact(
@@ -107,7 +113,7 @@ def _endpoint_impact(
     )
     if not window.contains(point):
         return None
-    return EndpointImpact(endpoint=endpoint, needed_delay=window.minutes_from(point))
+    return EndpointImpact(endpoint=endpoint, needed_wait=window.wait_from(point))
 
 
 def classify_flight(
@@ -132,25 +138,46 @@ def classify_flight(
         affected_endpoint = endpoints[0].endpoint
 
     # Required delay is driven by the endpoint that can resume latest.
-    finite_needed = [e.needed_delay for e in endpoints if e.needed_delay is not None]
-    if len(finite_needed) < len(endpoints):
+    finite_waits = [e.needed_wait for e in endpoints if e.needed_wait is not None]
+    if len(finite_waits) < len(endpoints):
         status = IMPACT_PENDING
-        needed_delay: int | None = None
+        needed_wait: timedelta | None = None
     else:
-        needed_delay = max(finite_needed)  # type: ignore[arg-type]
-        if flight.can_retime and needed_delay <= flight.max_delay_minutes:
+        needed_wait = max(finite_waits)  # type: ignore[arg-type]
+        # Business judgement uses the raw wait, never the rounded display
+        # minutes. A second-precision airline limit compares exact microseconds;
+        # a minute-precision limit compares the executable (ceiling) minutes.
+        if flight.max_delay_seconds is not None:
+            within_limit = needed_wait <= timedelta(seconds=flight.max_delay_seconds)
+        else:
+            within_limit = ceil_minutes(needed_wait) <= flight.max_delay_minutes
+        if flight.can_retime and within_limit:
             status = IMPACT_DELAYED
         else:
             status = IMPACT_CANCELLED
 
+    if needed_wait is None:
+        overlap_seconds: int | float | None = None
+        overlap_minutes: int | None = None
+    else:
+        overlap_seconds = _seconds_value(needed_wait)
+        overlap_minutes = ceil_minutes(needed_wait)
+
     proposed_departure = proposed_arrival = None
-    overlap = needed_delay
+    delay_minutes = None
+    delay_seconds = None
     if status == IMPACT_DELAYED:
+        assert needed_wait is not None
+        delay_minutes = ceil_minutes(needed_wait)
+        # The executable hold is the ceiling in whole minutes; shifting by the
+        # raw wait instead would leave a fractional-second landing inside the
+        # still-closed window.
+        delay_seconds = delay_minutes * 60
         proposed_departure = iso_utc(
-            flight.scheduled_departure + timedelta(minutes=needed_delay)  # type: ignore[arg-type]
+            flight.scheduled_departure + timedelta(minutes=delay_minutes)
         )
         proposed_arrival = iso_utc(
-            flight.scheduled_arrival + timedelta(minutes=needed_delay)  # type: ignore[arg-type]
+            flight.scheduled_arrival + timedelta(minutes=delay_minutes)
         )
 
     return {
@@ -159,8 +186,10 @@ def classify_flight(
         "airport_code": window.airport_code,
         "affected_endpoint": affected_endpoint,
         "impact_status": status,
-        "overlap_minutes": overlap,
-        "delay_minutes": needed_delay if status == IMPACT_DELAYED else None,
+        "overlap_seconds": overlap_seconds,
+        "overlap_minutes": overlap_minutes,
+        "delay_seconds": delay_seconds if status == IMPACT_DELAYED else None,
+        "delay_minutes": delay_minutes,
         "proposed_departure": proposed_departure,
         "proposed_arrival": proposed_arrival,
         "passenger_count": flight.passenger_count,
@@ -195,3 +224,11 @@ def airport_tz(airport: Airport):
     from zoneinfo import ZoneInfo
 
     return ZoneInfo(airport.timezone)
+
+
+def _seconds_value(delta: timedelta) -> int | float:
+    """整秒返回 int（避免输出 55.0），带微秒时保留到小数后 6 位。"""
+    seconds = delta.total_seconds()
+    if seconds == int(seconds):
+        return int(seconds)
+    return round(seconds, 6)  # timedelta 的分辨率就是微秒

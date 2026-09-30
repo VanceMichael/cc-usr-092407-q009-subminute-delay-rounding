@@ -129,6 +129,19 @@ def load_flights(fixtures_dir: Path, airports: dict[str, Airport]) -> dict[str, 
             raise AppError(f"{source}.max_delay_minutes must be a non-negative integer")
         if not can_retime and max_delay != 0:
             raise AppError(f"{source}: max_delay_minutes must be 0 when can_retime is false")
+        # Optional airline limit precise to the second. When present it is the
+        # authoritative business constraint; max_delay_minutes stays for display.
+        max_delay_seconds = None
+        if "max_delay_seconds" in item and item["max_delay_seconds"] is not None:
+            max_delay_seconds = item["max_delay_seconds"]
+            if (
+                not isinstance(max_delay_seconds, int)
+                or isinstance(max_delay_seconds, bool)
+                or max_delay_seconds < 0
+            ):
+                raise AppError(f"{source}.max_delay_seconds must be a non-negative integer")
+            if not can_retime and max_delay_seconds != 0:
+                raise AppError(f"{source}: max_delay_seconds must be 0 when can_retime is false")
         flights[flight_id] = Flight(
             flight_id=flight_id,
             flight_number=str(item["flight_number"]),
@@ -139,6 +152,7 @@ def load_flights(fixtures_dir: Path, airports: dict[str, Airport]) -> dict[str, 
             passenger_count=passengers,
             can_retime=can_retime,
             max_delay_minutes=max_delay,
+            max_delay_seconds=max_delay_seconds,
         )
     if not flights:
         raise AppError("fixtures/flights.json contains no flights")

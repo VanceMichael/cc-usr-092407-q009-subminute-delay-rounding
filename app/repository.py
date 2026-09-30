@@ -39,7 +39,9 @@ CREATE TABLE IF NOT EXISTS impacts (
     flight_number      TEXT NOT NULL,
     affected_endpoint  TEXT NOT NULL,
     impact_status      TEXT NOT NULL,
+    overlap_seconds    NUMERIC,
     overlap_minutes    INTEGER,
+    delay_seconds      NUMERIC,
     delay_minutes      INTEGER,
     proposed_departure TEXT,
     proposed_arrival   TEXT,
@@ -74,6 +76,20 @@ class Repository:
             self._conn.execute("PRAGMA foreign_keys=ON")
             self._conn.execute("PRAGMA synchronous=FULL")
             self._conn.executescript(SCHEMA)
+            self._migrate_columns()
+
+    def _migrate_columns(self) -> None:
+        """为旧版数据库补齐秒级列；历史行保持原有分钟口径不变。"""
+        existing = {
+            r["name"]
+            for r in self._conn.execute("PRAGMA table_info(impacts)").fetchall()
+        }
+        for column, ddl in (
+            ("overlap_seconds", "ALTER TABLE impacts ADD COLUMN overlap_seconds NUMERIC"),
+            ("delay_seconds", "ALTER TABLE impacts ADD COLUMN delay_seconds NUMERIC"),
+        ):
+            if column not in existing:
+                self._conn.execute(ddl)
 
     def close(self) -> None:
         with self._lock:
@@ -207,12 +223,16 @@ class Repository:
             """
             INSERT INTO impacts (event_id, root_event_id, airport_code, flight_id,
                                  flight_number, affected_endpoint, impact_status,
-                                 overlap_minutes, delay_minutes, proposed_departure,
-                                 proposed_arrival, passenger_count, crosses_midnight)
+                                 overlap_seconds, overlap_minutes,
+                                 delay_seconds, delay_minutes,
+                                 proposed_departure, proposed_arrival,
+                                 passenger_count, crosses_midnight)
             VALUES (:event_id, :root_event_id, :airport_code, :flight_id,
                     :flight_number, :affected_endpoint, :impact_status,
-                    :overlap_minutes, :delay_minutes, :proposed_departure,
-                    :proposed_arrival, :passenger_count, :crosses_midnight)
+                    :overlap_seconds, :overlap_minutes,
+                    :delay_seconds, :delay_minutes,
+                    :proposed_departure, :proposed_arrival,
+                    :passenger_count, :crosses_midnight)
             """,
             list(impacts),
         )

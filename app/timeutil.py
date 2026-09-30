@@ -66,12 +66,29 @@ def overlaps(start_a: datetime, end_a: datetime, start_b: datetime, end_b: datet
     return start_a < end_b and start_b < end_a
 
 
+def ceil_minutes(delta: timedelta) -> int:
+    """把任意正时间差向上取整到可执行分钟；恰好零秒取 0。
+
+    任何正的等待（哪怕只有一秒）都必须取至少一分钟，不能用整除向下
+    抹成 0，否则建议时刻会把航班排回机场尚未开放的时刻。
+    """
+    seconds = delta.total_seconds()
+    if seconds <= 0:
+        return 0
+    return int(-(-seconds // 60))  # math.ceil(seconds / 60)，对浮点同样成立
+
+
+def floor_minutes(delta: timedelta) -> int:
+    """把时间差向下取整到分钟（用于事件窗口长度这类“不少于 N 分钟”的校验）。"""
+    return int(delta.total_seconds() // 60)
+
+
 def overlap_minutes(
     start_a: datetime, end_a: datetime, start_b: datetime, end_b: datetime
 ) -> int:
     start = max(start_a, start_b)
     end = min(end_a, end_b)
-    return max(0, int((end - start).total_seconds() // 60))
+    return max(0, floor_minutes(end - start))
 
 
 def crosses_local_midnight(

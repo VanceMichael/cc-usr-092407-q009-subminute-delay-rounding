@@ -51,6 +51,7 @@ class Flight:
     passenger_count: int
     can_retime: bool
     max_delay_minutes: int
+    max_delay_seconds: int | None = None  # airline limit precise to the second; minutes field is display-only when set
 
     @property
     def duration_minutes(self) -> int:
@@ -86,8 +87,12 @@ class DisruptionEvent:
 
 
 def iso_utc(dt: datetime) -> str:
-    """将带时区时间输出为规范的 UTC ISO 8601 字符串。"""
+    """将带时区时间输出为规范的 UTC ISO 8601 字符串。
+
+    保留微秒精度：事件与建议时刻落库后必须能无损重放，分类不能因为序列化
+    把小数秒抹掉而改变（例如 30 秒等待在重启后被误判为零等待）。
+    """
     from app.timeutil import to_utc
 
     dt = to_utc(dt)
-    return dt.strftime("%Y-%m-%dT%H:%M:%SZ")
+    return dt.replace(tzinfo=None).isoformat() + "Z"
